@@ -300,6 +300,20 @@ def fit_power_law_alpha(z,U,zref=80.0,Uref=8.0):
     R2 = 1.0 - (SSres/SStot)
     return alpha, R2
 
+def calc_lowess_mean(ds,win_size,lowess_delta):
+    if isinstance(ds,xr.core.dataset.Dataset):
+        ds = ds.data
+    series_length = len(ds)
+    sm_frac = win_size/series_length
+    exog = np.arange(series_length)
+
+    init_ds_means = True
+
+    mean_lowess = lowess(ds.data, exog, 
+                         frac=sm_frac, 
+                         delta=lowess_delta)[:,1]
+    return(mean_lowess)
+
 def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_delta=0):
     """
     Augment an a2e-mmc standard, xarrays-based, data structure of 
@@ -339,9 +353,6 @@ def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_d
         print('calculating lowess means')
         series_length = ds[mean_dim].data.size
         win_size = 18000
-        sm_frac = win_size/series_length
-
-        exog = np.arange(len(ds[mean_dim].data))
 
         init_ds_means = True
         for varn in var_keys:
@@ -359,9 +370,8 @@ def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_d
                 var = ds[varn].isel(nz=kk).values
                 for jj in ds.ny.data:
                     for ii in ds.nx.data:
-                        lowess_smth[:,kk,jj,ii] = lowess(var[:,jj,ii], exog, 
-                                                         frac=sm_frac, 
-                                                         delta=lowess_delta)[:,1]
+                        lowess_smth[:,kk,jj,ii] = calc_lowess_mean(var[:,jj,ii],win_size,lowess_delta)
+                        
                 print('k-loop: {} seconds'.format(time.time()-k_loop_start))
                 loop_end = time.time()
             print('total time: {} seconds'.format(loop_end - loop_start))
