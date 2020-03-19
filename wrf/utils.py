@@ -353,9 +353,9 @@ class Tower():
                         setattr(self, name.lower(), col.values)
                     self.ts_varns = list(tsdata.columns)
 
-    def to_dataframe(self,
-                     start_time='2013-11-08',time_unit='h',time_step=None,
-                     heights=None,height_var='height',
+    def to_dataframe(self,start_time,
+                     time_unit='h',time_step=None,
+                     heights=None,height_var='height',agl=False,
                      exclude=['ts']):
         """Convert tower time-height data into a dataframe.
         
@@ -365,23 +365,28 @@ class Tower():
             The datetime index is constructed from a pd.TimedeltaIndex
             plus this start_time, where the timedelta index is formed by
             the saved time array.
-        time_unit: str
+        time_unit: str, optional
             Timedelta unit for constructing datetime index, only used if
             time_step is None.
-        time_step: float or None
+        time_step: float or None, optional
             Time-step size, in seconds, to override the output times in
             the data files. Used in conjunction with start_time to form
             the datetime index. May be useful if times in output files
             do not have sufficient precision.
-        heights : array-like or None
+        heights : array-like or None, optional
             If None, then use integer levels for the height index,
             otherwise interpolate to the same heights at all times.
-        height_var : str
+        height_var : str, optional
             Name of attribute with actual height values to form the
             height index. If heights is None, then this must match the
             number of height levels; otherwise, this may be constant
             or variable in time.
-        exclude : list
+        agl : bool, optional
+            Heights by default are specified above sea level; if True,
+            then the "stationz" attribute is used to convert to heights
+            above ground level (AGL).  This only applies if heights are
+            specified.
+        exclude : list, optional
             List of fields to excldue from the output dataframe. By
             default, the surface time-series data ('ts') are excluded.
         """
@@ -422,6 +427,8 @@ class Tower():
             from scipy.interpolate import interp1d
             z = np.array(heights)
             zt = getattr(self, height_var)
+            if agl:
+                zt -= self.stationz
             if len(zt.shape) == 1:
                 # approximately constant height (with time)
                 assert len(zt) == self.nz
@@ -807,16 +814,18 @@ def extract_column_from_wrfdata(fpath, coords,
 
 
 def combine_towers(fdir, restarts, simulation_start, fname, return_type='xarray', structure='ordered',
-                   time_step=None):
+                   time_step=None, heights=None, height_var='heights'):
     '''
     Combine together tslist files in time where, if there is any overlap, the later file
     will overwrite the earlier file. This makes the assumption that all of the tslist 
     files are stored in separate directories but named the same (default in WRF is to 
-    name them the same).
+    name them the same). Each restart directory must have a simulation_start string to
+    specify when the timing starts (use same time if run was an actual restart, use WRF
+    start time if you are combining several runs).
 
     fdir             = 'path/to/restart/directories/'
     restarts         = ['restart_dir_1', 'restart_dir_2', 'restart_dir_3']
-    simulation_start = '2000-01-01 00:00'
+    simulation_start = ['2000-01-01 00:00','2000-01-01 00:00','2000-01-01 00:00']
     fname            = ['t0001.d02'] (Note: this is the prefix for the tower + domain)
     return_type      = 'xarray' or 'dataframe'
     structure        = 'ordered' or 'unordered'
@@ -824,19 +833,29 @@ def combine_towers(fdir, restarts, simulation_start, fname, return_type='xarray'
     This will work with a pandas df or an xarray ds/da
     '''
     for rst,restart in enumerate(restarts):
+        if np.size(simulation_start) == 1:
+            sim_start = simulation_start
+        elif np.size(simulation_start) == np.size(restarts):
+            sim_start = simulation_start[rst]
+        else:
+            raise ValueError('restarts and simulation_start are not equal')
         print('restart: {}'.format(restart))
         data = []
         for ff in fname:
             
             print('starting {}'.format(ff))
             if return_type == 'xarray':
-                data.append(Tower('{}{}/{}'.format(fdir,restart,ff)).to_xarray(start_time=simulation_start,
-                                                                            time_step=time_step,height_var='k',
-                                                                            structure=structure))
+                data.append(Tower('{}{}/{}'.format(fdir,restart,ff)).to_xarray(start_time=sim_start,
+                                                                            time_step=time_step,
+                                                                            structure=structure,
+                                                                            heights=heights,
+                                                                            height_var=height_var))
             elif return_type == 'dataframe':
-                data.append(Tower('{}{}/{}'.format(fdir,restart,ff)).to_dataframe(start_time=simulation_start,
-                                                                            time_step=time_step,height_var='k',
-                                                                            structure=structure))
+                data.append(Tower('{}{}/{}'.format(fdir,restart,ff)).to_dataframe(start_time=sim_start,
+                                                                            time_step=time_step,
+                                                                            structure=structure,
+                                                                            heights=heights,
+                                                                            height_var=height_var))
         data_block = xr.combine_by_coords(data)
         if np.shape(restarts)[0] > 1:
             if rst == 0:
@@ -866,7 +885,7 @@ def combine_towers(fdir, restarts, simulation_start, fname, return_type='xarray'
     dataF['wspd'] = (dataF['u']**2.0 + dataF['v']**2.0)**0.5
     dataF['wdir'] = 180. + np.degrees(np.arctan2(dataF['u'], dataF['v']))        
 
-    dataF.attrs['SIMULATION_START_DATE'] = simulation_start
+    dataF.attrs['SIMULATION_START_DATE'] = sim_start
     dataF.attrs['CREATED_FROM'] = fdir
 
     # -------------------------------------------------------       
@@ -879,31 +898,51 @@ def combine_towers(fdir, restarts, simulation_start, fname, return_type='xarray'
 
 
 def tsout_seriesReader(fdir, restarts, simulation_start_time, domain_of_interest, structure='ordered',
-                       time_step=None):
+                       time_step=None, heights=None, height_var='heights',select_tower=None):
     '''
     This will combine a series of tslist output over time and location based on the
     path to the case (fdir), the restart directories (restarts), a model start time 
-    (simulation_start_time), and the domain of interest for the 
-    towers (domain_of_interest).
+    (simulation_start_time), and the domain of interest for the towers
+    (domain_of_interest). You can select individual towers or a set of towers by
+    specifying a list or array in select_towers. Tower levels can be interpolated
+    to specified heights by specifying 'heights' and 'height_var' where height_var
+    is the variable that contains height values.
 
     fdir                  = 'path/to/restart/directories/'
     restarts              = ['tsout_1800_1830','tsout_1830_1900','tsout_1900_1930','tsout_1930_2000']
     simulation_start_time = '2013-11-08 14:00'
     domain_of_interest    = 'd02'
+    time_step             = 10.0 
+    heights               = [20.0, 50.0, 100.0]
+    height_var            = 'ph'
+    select_tower          = ['TS1','TS5']
     '''
     ntimes = np.shape(restarts)[0]
-    floc = '{}{}/*{}*'.format(fdir,restarts[0],domain_of_interest)
+    floc = '{}{}/*{}.??'.format(fdir,restarts[0],domain_of_interest)
     file_list = glob.glob(floc)
+
     for ff,file in enumerate(file_list):
         file = file[:-3]
         file_list[ff] = file
+    for f in file_list: 
+        if 'geo_em' in f: file_list.remove(f)
+
     file_list = np.unique(file_list)
     tower_names = file_list.copy()
     for ff,file in enumerate(file_list):
         tower_names[ff] = file.split('/')[-1]
-    #tower_names = tower_names[:2]
+        
+    if not isinstance(select_tower,(list)):
+        select_tower = list(select_tower)
+    if select_tower is not None:
+        good_towers = []
+        for twr in select_tower:
+            for twr_n in tower_names:
+                if twr in twr_n: good_towers.append(twr_n)
+        tower_names = good_towers
+    
     dsF = combine_towers(fdir,restarts,simulation_start_time,tower_names,return_type='xarray',
-                         structure=structure, time_step=time_step)
+                         structure=structure, time_step=time_step, heights=heights, height_var=height_var)
     return dsF
 
 

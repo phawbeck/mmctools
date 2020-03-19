@@ -5,8 +5,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import time
-from statsmodels.nonparametric.smoothers_lowess import lowess
-
 
 
 # constants
@@ -15,7 +13,7 @@ epsilon = 0.622 # ratio of molecular weights of water to dry air
 
 def e_s(T, celsius=False, model='Tetens'):
     """Calculate the saturation vapor pressure of water, $e_s$ [mb]
-    given the air temperature.
+    given the air temperature ([K] by default).
     """
     if celsius:
         # input is deg C
@@ -63,12 +61,15 @@ def T_d(T, RH, celsius=False, model='NWS'):
     return Td
 
 
-def w_s(T,p,celsius=False):
+def w_s(T,p,**kwargs):
     """Calculate the saturation mixing ratio, $w_s$ [kg/kg] given the
-    air temperature and station pressure [mb].
+    air temperature ([K] by default) and station pressure [mb].
+
+    See e_s() for additional information for the kwargs.
     """
-    es = e_s(T,celsius)
-    # From Wallace & Hobbs, Eqn 3.63
+    # First calculate the saturation vapor pressure
+    es = e_s(T,**kwargs)
+    # From Wallace & Hobbs, Eqn 3.63:
     return epsilon * es / (p - es)
 
 
@@ -105,10 +106,15 @@ def T_to_Tv(T,p=None,RH=None,e=None,w=None,Td=None,
             # we also have specific humidity, q, at this point (not needed)
             q = w / (1+w)
             print('q(T,p,RH) =',q)
-        # Using Wallace & Hobbs, Eqn 3.59
         if verbose:
-            # sanity check!
+            # sanity check: Wallace & Hobbs, Eqn 3.60
+            # - assumes mixing ratio is small (i.e., w^2 ~ 0)
+            #   Tv - T = (1-epsilon)/epsilon * wT / (1 + w)
+            #          = (1-epsilon)/epsilon * wT * (1 - w + w^2 + ...)
+            #         ~= (1-epsilon)/epsilon * wT
+            #      Tv ~= T*(1 + ((1-epsilon)/epsilon)*w)
             print('Tv(T,p,RH) ~=',T*(1+0.61*w))
+        # Using Wallace & Hobbs, Eqn 3.59
         Tv = T * (w/epsilon + 1) / (1 + w)
     elif (e is not None) and (p is not None):
         # Definition of virtual temperature
@@ -142,7 +148,11 @@ def calc_wind(df,u='u',v='v'):
     """Calculate wind speed and direction from horizontal velocity
     components, u and v.
     """
-    if not all(velcomp in df.columns for velcomp in [u,v]):
+    if isinstance(df,pd.DataFrame):
+        fields = df.columns
+    elif isinstance(df,xr.Dataset):
+        fields = df.variables
+    if not all(velcomp in fields for velcomp in [u,v]):
         print(('velocity components u/v not found; '
                'set u and/or v to calculate wind speed/direction'))
     else:
@@ -153,7 +163,11 @@ def calc_wind(df,u='u',v='v'):
 def calc_uv(df,wspd='wspd',wdir='wdir'):
     """Calculate velocity components from wind speed and direction.
     """
-    if not all(windvar in df.columns for windvar in [wspd,wdir]):
+    if isinstance(df,pd.DataFrame):
+        fields = df.columns
+    elif isinstance(df,xr.Dataset):
+        fields = df.variables
+    if not all(windvar in fields for windvar in [wspd,wdir]):
         print(('wind speed/direction not found; '
                'set wspd and/or wpd to calculate velocity components'))
     else:
@@ -174,8 +188,20 @@ def theta(T, p, p0=1000.):
     """
     return T * (p0/p)**0.286
 
+# create alias for theta for consistency
+T_to_theta = theta
+def theta_to_T(theta,p,p0=1000.):
+    """Calculate (virtual) temperature [K], from (virtual) potential
+    temperature, theta, [K] and pressure p [mbar] using Poisson's equation.
 
-def covariance(a,b,interval='10min',resample=False):
+    Standard pressure p0 at sea level is 1000 mbar or hPa. 
+
+    Typical assumptions for dry air give:
+        R/cp = (287 J/kg-K) / (1004 J/kg-K) = 0.286
+    """
+    return theta / (p0/p)**0.286    
+
+def covariance(a,b,interval='10min',resample=False,**kwargs):
     """Calculate covariance between two series (with datetime index) in
     the specified interval, where the interval is defined by a pandas
     offset string
@@ -217,11 +243,11 @@ def covariance(a,b,interval='10min',resample=False):
     if resample:
         a_mean = a.resample(interval).mean()
         b_mean = b.resample(interval).mean()
-        ab_mean = (a*b).resample(interval).mean()
+        ab_mean = (a*b).resample(interval,**kwargs).mean()
     else:
         a_mean = a.rolling(interval).mean()
         b_mean = b.rolling(interval).mean()
-        ab_mean = (a*b).rolling(interval).mean()
+        ab_mean = (a*b).rolling(interval,**kwargs).mean()
     cov = ab_mean - a_mean*b_mean
     if have_multiindex:
         return cov.stack()
@@ -300,21 +326,26 @@ def fit_power_law_alpha(z,U,zref=80.0,Uref=8.0):
     R2 = 1.0 - (SSres/SStot)
     return alpha, R2
 
-def calc_lowess_mean(ds,win_size,lowess_delta):
-    if isinstance(ds,xr.core.dataset.Dataset):
-        ds = ds.data
-    series_length = len(ds)
+def lowess_mean(ds,win_size,lowess_delta):
+    '''
+    This will calculate the lowess mean with specified window size
+    and lowess delta.
+    ds : xarray dataset or data array
+    win_size : float
+    lowess_delta: float
+    '''
+    series_length = ds.data.size
     sm_frac = win_size/series_length
-    exog = np.arange(series_length)
+    exog = np.arange(len(ds.data))
 
     init_ds_means = True
 
-    mean_lowess = lowess(ds.data, exog, 
+    lowess_smth = lowess(ds.data, exog, 
                          frac=sm_frac, 
                          delta=lowess_delta)[:,1]
-    return(mean_lowess)
+    return(lowess_smth)
 
-def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_delta=0):
+def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_delta=0, lowess_window=None):
     """
     Augment an a2e-mmc standard, xarrays-based, data structure of 
     4-dimensional model output with space-based quantities of interest
@@ -351,9 +382,6 @@ def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_d
         ds_means = ds.mean(dim=mean_dim)
     elif mean_opt == 'lowess':
         print('calculating lowess means')
-        series_length = ds[mean_dim].data.size
-        win_size = 18000
-
         init_ds_means = True
         for varn in var_keys:
             print(varn)
@@ -370,8 +398,9 @@ def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_d
                 var = ds[varn].isel(nz=kk).values
                 for jj in ds.ny.data:
                     for ii in ds.nx.data:
-                        lowess_smth[:,kk,jj,ii] = calc_lowess_mean(var[:,jj,ii],win_size,lowess_delta)
-                        
+                        lowess_smth[:,kk,jj,ii] = lowess_mean(var[:,jj,ii], 
+                                                         win_size=lowess_window,
+                                                         delta=lowess_delta)
                 print('k-loop: {} seconds'.format(time.time()-k_loop_start))
                 loop_end = time.time()
             print('total time: {} seconds'.format(loop_end - loop_start))
@@ -408,7 +437,7 @@ def model4D_calcQOIs(ds,mean_dim,data_type='wrfout', mean_opt='static', lowess_d
     ds['TKE'] = 0.5*np.sqrt(ds['UU']+ds['ww'])
     ds.attrs['MEAN_OPT'] = mean_opt
     if mean_opt == 'lowess':
-        ds.attrs['WINDOW_SIZE'] = win_size
+        ds.attrs['WINDOW_SIZE'] = lowess_window
         ds.attrs['LOWESS_DELTA'] = lowess_delta
     return ds
 
@@ -819,3 +848,79 @@ def reference_lines(x_range, y_start, slopes, line_type='log'):
             shift = y_start/y_range[0,ss]
             y_range[:,ss] = y_range[:,ss]*shift
     return(y_range)
+
+
+def estimate_ABL_height(T=None,Tw=None,uw=None,sanitycheck=True,**kwargs):
+    """Estimate the height of the atmospheric boundary layer (ABL) with
+    a variety of methods. The recommended approach is Tw during convective
+    conditions and uw during stable conditions.
+
+    Parameters
+    ==========
+    All inputs should be multi-indexed pandas Series, unless otherwise
+    specified, with the index levels being datetime (0) and height (1).
+    T : 
+        Estimate the height of the ABL from the potential temperature
+        (T) profile. The height is given as where the gradient of
+        potential temperature is smaller than some threshold. Additional
+        parameters:
+        - threshold (default=0.065 K/m)
+            Temperature gradient that describes the inversion layer.
+        - zmin (default=0 m)
+            Height above ground to start looking for the inversion.
+    Tw :
+        Estimate the height of the convective boundary layer from the
+        instantaneous minima in vertical heat flux <T'w'>.
+    uw :
+        Estimate the height of the stable boundary layer as the height
+        at which the tangential turbulent stress vanishes, where <u'w'>
+        is the magnitude of the horizontal components. Additional
+        parameters:
+        - cutoff (default=0.05)
+            Stress value from which the zero-stress height is
+            extrapolated.
+        Ref: Kosovic & Curry, JAS (2000)
+    sanitycheck : boolean, optional
+        Perform additional sanity checks (if any).
+    kwargs : optional keywords
+        Additional method-specific parameters.
+    """
+    ablh = None
+    if T is not None:
+        threshold = kwargs.get('threshold',0.065) # [K/m]
+        zmin = kwargs.get('zmin',0) # [m]
+        T = T.loc[T.index.get_level_values(1) >= zmin].unstack()
+        heights = np.array(T.columns)
+        dz = np.diff(heights)
+        newheights = (heights[:-1] + heights[1:]) / 2
+        dTdz = T.diff(axis=1).drop(columns=[heights[0]])
+        dTdz.columns = newheights
+        dTdz = dTdz.divide(dz, axis=1)
+        ablh = dTdz[dTdz >= threshold].apply(lambda s: s.first_valid_index(), axis=1)
+    elif Tw is not None:
+        ablh = Tw.unstack().idxmin(axis=1)
+        if sanitycheck:
+            Tw_at_ablh = Tw.loc[[(t,z) for t,z in ablh.iteritems()]]
+            assert np.all(Tw_at_ablh <= 0)
+    elif uw is not None:
+        # assume the turbulent stress maxima occur near the surface and
+        # equal u*
+        unstacked = uw.unstack()
+        ustar = unstacked.max(axis=1)
+        uw_norm = unstacked.divide(ustar, axis=0)
+        cutoff = kwargs.get('cutoff',0.05)
+        z_near0 = uw_norm[uw_norm <= cutoff].apply(lambda s: s.first_valid_index(), axis=1)
+        z_near0 = z_near0.fillna(method='bfill').fillna(method='ffill')
+        # get near-zero value of uw for extrapolation
+        uw_norm = uw_norm.stack(dropna=False)
+        uw_norm_near0 = uw_norm.loc[[(t,z) for t,z in z_near0.iteritems()]]
+        if sanitycheck:
+            assert np.all(uw_norm_near0.loc[~pd.isna(uw_norm_near0)] >= 0) 
+        # extrapolate
+        ablh = z_near0 / (1 - uw_norm_near0)
+        ablh = ablh.reset_index(level=1)[0]
+    else:
+        raise ValueError('No valid inputs provided')
+    ablh.name = 'ABLheight'
+    return ablh
+
